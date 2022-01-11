@@ -1,61 +1,94 @@
-#![no_main]
+//! CDC-ACM serial port example using polling in a busy loop.
+//! Target board: any STM32F4 with a OTG FS peripheral and a 25MHz HSE crystal
 #![no_std]
+#![no_main]
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-use cortex_m::{
-    self,
-    delay::Delay,
-    interrupt::{free, Mutex},
-    peripheral::NVIC,
-};
 use cortex_m_rt::entry;
+use stm32f4xx_hal::otg_fs::{UsbBus, USB};
+use stm32f4xx_hal::{pac, prelude::*};
+use usb_device::prelude::*;
 
 // These lines are part of our setup for debug printing.
 use defmt_rtt as _;
 use panic_probe as _;
 
-// Import parts of this library we use. You could use this style, or perhaps import
-// less here.
-use stm32_hal2::{
-    self,
-    adc::{self, Adc, AdcDevice},
-    clocks::Clocks,
-    gpio::{Edge, Pin, Port, PinMode, OutputType, Pull},
-    low_power,
-    pac,
-    timer::{Timer, TimerInterrupt},
-};
+static mut EP_MEMORY: [u32; 1024] = [0; 1024];
 
 #[entry]
 fn main() -> ! {
-    // Set up ARM Cortex-M peripherals. These are common to many MCUs, including all STM32 ones.
-    let mut cp = cortex_m::Peripherals::take().unwrap();
-    // Set up peripherals specific to the microcontroller you're using.
-    let mut dp = pac::Peripherals::take().unwrap();
+    let dp = pac::Peripherals::take().unwrap();
 
-    // This line is required to prevent the debugger from disconnecting on entering WFI.
-    // This appears to be a limitation of many STM32 families. Not required in production code,
-    // and significantly increases power consumption in low-power modes.
-    stm32_hal2::debug_workaround();
+    let rcc = dp.RCC.constrain();
 
-    // Create an initial clock configuration that uses the MCU's internal oscillator (HSI),
-    // sets the MCU to its maximum system clock speed.
-    let clock_cfg = Clocks::default();
+    let clocks = rcc
+        .cfgr
+        .use_hse(12.mhz())
+        .sysclk(48.mhz())
+        .require_pll48clk()
+        .freeze();
 
-    // Write the clock configuration to the MCU. If you wish, you can modify `clocks` above
-    // in accordance with [its docs](https://docs.rs/stm32-hal2/0.2.0/stm32_hal2/clocks/index.html),
-    // and the `clock_cfg` example.
-    clock_cfg.setup().unwrap();
+    let gpioa = dp.GPIOA.split();
+    let gpiob = dp.GPIOB.split();
+
+    let mut led_red = gpiob.pb4.into_push_pull_output();
+    let mut led_blue = gpiob.pb5.into_push_pull_output();
+    let mut led_green = gpioa.pa15.into_push_pull_output();
+    led_green.set_high();
+    led_blue.set_low();
+    led_red.set_low();
+
+    let usb = USB {
+        usb_global: dp.OTG_FS_GLOBAL,
+        usb_device: dp.OTG_FS_DEVICE,
+        usb_pwrclk: dp.OTG_FS_PWRCLK,
+        pin_dm: gpioa.pa11.into_alternate(),
+        pin_dp: gpioa.pa12.into_alternate(),
+        hclk: clocks.hclk(),
+    };
+
+    let usb_bus = UsbBus::new(usb, unsafe { &mut EP_MEMORY });
+
+    let mut serial = usbd_serial::SerialPort::new(&usb_bus);
+
+    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
+        .manufacturer("Fake company")
+        .product("Serial port")
+        .serial_number("TEST")
+        .device_class(usbd_serial::USB_CLASS_CDC)
+        .build();
 
     loop {
-        defmt::println!("Looping!"); // A print statement using DEFMT.
-        // Enter a low power mode. The program will wake once an interrupt fires.
-        // For example, the timer and GPIO interrupt above. But we haven't unmasked
-        // their lines, so they won't work - see the `interrupts` example for that.
-        low_power::sleep_now();
+        if !usb_dev.poll(&mut [&mut serial]) {
+            continue;
+        }
+
+        let mut buf = [0u8; 64];
+
+        match serial.read(&mut buf) {
+            Ok(count) if count > 0 => {
+                defmt::println!("{}", buf);
+                // Echo back in upper case
+                for c in buf[0..count].iter_mut() {
+                    if 0x61 <= *c && *c <= 0x7a {
+                        *c &= !0x20;
+                    }
+                }
+
+                let mut write_offset = 0;
+                while write_offset < count {
+                    match serial.write(&buf[write_offset..count]) {
+                        Ok(len) if len > 0 => {
+                            write_offset += len;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
+
 
 // same panicking *behavior* as `panic-probe` but doesn't print a panic message
 // this prevents the panic message being printed *twice* when `defmt::panic` is invoked
